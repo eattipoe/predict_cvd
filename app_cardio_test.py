@@ -1,11 +1,102 @@
-# app_cardio_test.py
+# app_cvd_predictor.py
+
 import streamlit as st
 import joblib
 import pandas as pd
 import sqlite3
 from datetime import datetime
 
+# ---------------- Helper functions ----------------
+
+def bmi_category(bmi: float) -> str:
+    """BMI categories (kg/m²)."""
+    if bmi < 18.5:
+        return "Underweight"
+    elif bmi < 25.0:
+        return "Normal"
+    elif bmi < 30.0:
+        return "Overweight"
+    elif bmi < 35.0:
+        return "Obese (Class I)"
+    else:
+        return "Obese (Class II/III)"
+
+def bp_category(sys: float, dia: float) -> str:
+    """
+    BP categories:
+      - Normal:   systolic <120 and diastolic <80
+      - Elevated: 120–139 and diastolic <90
+      - Hypertension: systolic ≥140 or diastolic ≥90
+      - Otherwise: At-Risk (Borderline)
+    """
+    if sys < 120 and dia < 80:
+        return "Normal"
+    if sys >= 140 or dia >= 90:
+        return "Hypertension"
+    if 120 <= sys <= 139 and dia < 90:
+        return "Elevated"
+    return "At-Risk (Borderline)"
+
+def cholesterol_category(chol: float) -> str:
+    """Total cholesterol in mmol/L."""
+    if chol < 5.2:
+        return "Normal"
+    elif chol < 6.2:
+        return "Borderline / At-Risk"
+    else:
+        return "Abnormal / High Risk"
+
+def glucose_category(glu: float) -> str:
+    """Fasting glucose in mmol/L."""
+    if glu < 5.6:
+        return "Normal"
+    elif glu < 7.0:
+        return "Prediabetes"
+    else:
+        return "Diabetes"
+
+def overall_risk_level(bmi_cat: str, bp_cat: str, chol_cat: str, glu_cat: str) -> str:
+    """
+    Flexible overall risk:
+      - High when multiple high-risk factors
+      - Moderate for single high-risk or several borderline
+      - Low when most values are normal
+    """
+    high_flags = 0
+    moderate_flags = 0
+
+    # BMI
+    if bmi_cat in ["Overweight", "Obese (Class I)", "Obese (Class II/III)"]:
+        high_flags += 1
+
+    # BP
+    if bp_cat == "Hypertension":
+        high_flags += 1
+    elif bp_cat in ["Elevated", "At-Risk (Borderline)"]:
+        moderate_flags += 1
+
+    # Cholesterol
+    if chol_cat == "Abnormal / High Risk":
+        high_flags += 1
+    elif chol_cat == "Borderline / At-Risk":
+        moderate_flags += 1
+
+    # Glucose
+    if glu_cat == "Diabetes":
+        high_flags += 1
+    elif glu_cat == "Prediabetes":
+        moderate_flags += 1
+
+    if high_flags >= 2:
+        return "High Overall Risk"
+    if high_flags == 1 and moderate_flags >= 1:
+        return "High Overall Risk"
+    if high_flags == 1 or moderate_flags >= 2:
+        return "Moderate Overall Risk"
+    return "Low Overall Risk"
+
 # ---------------- DB SETUP ----------------
+
 @st.cache_resource
 def get_connection():
     conn = sqlite3.connect("cvd_predictions.db", check_same_thread=False)
@@ -18,15 +109,13 @@ def get_connection():
             gender INTEGER,
             gender_label TEXT,
             bmi REAL,
-            ap_hi REAL,
-            ap_lo REAL,
-            cholesterol REAL,
-            gluc REAL,
-            smoke INTEGER,
-            alco INTEGER,
-            active INTEGER,
+            systolic_bp REAL,
+            diastolic_bp REAL,
+            cholesterol_mmol REAL,
+            glucose_mmol REAL,
             pred INTEGER,
-            prob REAL
+            prob REAL,
+            category_hint TEXT
         )
         """
     )
@@ -35,16 +124,27 @@ def get_connection():
 conn = get_connection()
 
 def save_prediction_to_db(
-    age_years, gender, gender_label, bmi, ap_hi, ap_lo,
-    cholesterol, gluc, smoke, alco, active, pred, prob
+    age_years,
+    gender,
+    gender_label,
+    bmi,
+    systolic_bp,
+    diastolic_bp,
+    cholesterol,
+    glucose,
+    pred,
+    prob,
+    category_hint,
 ):
     ts = datetime.utcnow().isoformat()
     conn.execute(
         """
         INSERT INTO predictions (
-            timestamp, age_years, gender, gender_label, bmi, ap_hi, ap_lo,
-            cholesterol, gluc, smoke, alco, active, pred, prob
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            timestamp, age_years, gender, gender_label, bmi,
+            systolic_bp, diastolic_bp, cholesterol_mmol, glucose_mmol,
+            pred, prob, category_hint
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             ts,
@@ -52,21 +152,20 @@ def save_prediction_to_db(
             int(gender),
             gender_label,
             float(bmi),
-            float(ap_hi),
-            float(ap_lo),
+            float(systolic_bp),
+            float(diastolic_bp),
             float(cholesterol),
-            float(gluc),
-            int(smoke),
-            int(alco),
-            int(active),
+            float(glucose),
             int(pred),
             float(prob),
+            category_hint,
         ),
     )
     conn.commit()
 
 # ---------------- MODEL LOAD ----------------
-bundle = joblib.load("cardio_test_stacked_model.pkl")
+
+bundle = joblib.load("cardio_mmol_stacked_model.pkl")
 model = bundle["model"]
 feature_names = bundle["feature_names"]
 feature_defaults = bundle["feature_defaults"]
@@ -79,105 +178,124 @@ st.markdown(
 )
 
 # --- MAIN INPUTS ---
+
 age_years = st.number_input("Age (years)", min_value=18, max_value=100, value=50)
 
 gender_label = st.selectbox("Gender", options=["Male", "Female"])
-# Dataset convention: 1=female, 2=male
+# 1 = female, 2 = male
 gender = 2 if gender_label == "Male" else 1
 
-bmi = st.number_input("Body Mass Index (BMI)", min_value=10.0, max_value=60.0, value=25.0, step=0.1)
+bmi = st.number_input(
+    "Body Mass Index (BMI, kg/m²)",
+    min_value=10.0,
+    max_value=60.0,
+    value=25.0,
+    step=0.1,
+)
 
-ap_hi = st.number_input("Systolic BP (mmHg)", min_value=80, max_value=260, value=130)
-ap_lo = st.number_input("Diastolic BP (mmHg)", min_value=40, max_value=150, value=85)
-
-# NEW: cholesterol in mg/dL
-cholesterol = st.number_input(
-    "Total Cholesterol (mg/dL)",
-    min_value=120.0,
-    max_value=320.0,
-    value=200.0,
+systolic_bp = st.number_input(
+    "Systolic BP (mmHg)",
+    min_value=80.0,
+    max_value=260.0,
+    value=130.0,
     step=1.0,
 )
 
-# --- OPTIONAL / ADVANCED INPUTS ---
-with st.expander("Advanced options (optional)"):
-    gluc = st.number_input(
-        "Glucose (same scale as training data)",
-        min_value=0.0,
-        max_value=10.0,
-        value=float(feature_defaults.get("gluc", 1.0)),
-        step=0.1,
-    )
-    smoke = st.selectbox(
-        "Smoker (smoke)",
-        options=[0, 1],
-        format_func=lambda x: "Yes" if x == 1 else "No",
-        index=int(feature_defaults.get("smoke", 0)),
-    )
-    alco = st.selectbox(
-        "Alcohol intake (alco)",
-        options=[0, 1],
-        format_func=lambda x: "Yes" if x == 1 else "No",
-        index=int(feature_defaults.get("alco", 0)),
-    )
-    active = st.selectbox(
-        "Physically active (active)",
-        options=[0, 1],
-        format_func=lambda x: "Yes" if x == 1 else "No",
-        index=int(feature_defaults.get("active", 1)),
-    )
+diastolic_bp = st.number_input(
+    "Diastolic BP (mmHg)",
+    min_value=40.0,
+    max_value=150.0,
+    value=85.0,
+    step=1.0,
+)
+
+cholesterol = st.number_input(
+    "Total Cholesterol (mmol/L)",
+    min_value=3.0,
+    max_value=9.0,
+    value=5.0,
+    step=0.1,
+)
+
+glucose = st.number_input(
+    "Fasting Glucose (mmol/L)",
+    min_value=3.0,
+    max_value=15.0,
+    value=5.0,
+    step=0.1,
+)
 
 st.markdown(
     "> This tool is for decision support only and does **not** replace professional medical advice."
 )
 
 if st.button("Predict CVD Risk"):
-    # Start from defaults
+    # Base row from training medians
     row = dict(feature_defaults)
 
     # Override with user inputs
     row["age_years"] = age_years
     row["gender"] = gender
     row["bmi"] = bmi
-    row["ap_hi"] = ap_hi
-    row["ap_lo"] = ap_lo
-    row["cholesterol"] = cholesterol  # mg/dL
-    row["gluc"] = gluc
-    row["smoke"] = smoke
-    row["alco"] = alco
-    row["active"] = active
+    row["systolic_bp"] = systolic_bp
+    row["diastolic_bp"] = diastolic_bp
+    row["cholesterol"] = cholesterol
+    row["glucose"] = glucose
 
-    # Build dataframe in correct order
     X_new = pd.DataFrame([row])[feature_names]
 
-    # Predict
-    prob = float(model.predict_proba(X_new)[0, 1])
-    pred = int(model.predict(X_new)[0])
+    # Model outputs
+    prob_model = float(model.predict_proba(X_new)[0, 1])
 
-    label = "CVD (High Risk)" if pred == 1 else "No CVD (Low Risk)"
+    # Detailed categories
+    bmi_cat = bmi_category(bmi)
+    bp_cat = bp_category(systolic_bp, diastolic_bp)
+    chol_cat = cholesterol_category(cholesterol)
+    glu_cat = glucose_category(glucose)
+    overall = overall_risk_level(bmi_cat, bp_cat, chol_cat, glu_cat)
+
+    # ----- Reconcile prediction with overall risk -----
+    # Force consistency: Overall risk drives final prediction
+    if overall == "High Overall Risk":
+        final_pred = 1
+    elif overall == "Low Overall Risk":
+        final_pred = 0
+    else:  # Moderate Overall Risk
+        final_pred = 1 if prob_model >= 0.5 else 0
+
+    label = "CVD (High Risk)" if final_pred == 1 else "No CVD (Low Risk)"
+
     st.subheader(f"Prediction: {label}")
-    st.write(f"Estimated CVD probability: **{prob:.3f}**")
+    st.write(f"Estimated model CVD probability: **{prob_model:.3f}**")
 
-    # ---------- SAVE TO DB ----------
+    category_hint = (
+        f"BMI: {bmi_cat}; "
+        f"BP: {bp_cat}; "
+        f"Cholesterol: {chol_cat}; "
+        f"Glucose: {glu_cat}; "
+        f"Overall: {overall}"
+    )
+
+    st.markdown(f"**Risk Profile:** {category_hint}")
+
+    # ---- Save to DB using final_pred ----
     save_prediction_to_db(
         age_years=age_years,
         gender=gender,
         gender_label=gender_label,
         bmi=bmi,
-        ap_hi=ap_hi,
-        ap_lo=ap_lo,
+        systolic_bp=systolic_bp,
+        diastolic_bp=diastolic_bp,
         cholesterol=cholesterol,
-        gluc=gluc,
-        smoke=smoke,
-        alco=alco,
-        active=active,
-        pred=pred,
-        prob=prob,
+        glucose=glucose,
+        pred=final_pred,
+        prob=prob_model,
+        category_hint=category_hint,
     )
 
     st.success("Record saved to database ✅")
 
-# Optional: view last few records
+# Optional: view recent records
 with st.expander("Show recent saved predictions"):
     df_log = pd.read_sql_query(
         "SELECT * FROM predictions ORDER BY id DESC LIMIT 10", conn
