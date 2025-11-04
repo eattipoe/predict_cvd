@@ -2,8 +2,70 @@
 import streamlit as st
 import joblib
 import pandas as pd
+import sqlite3
+from datetime import datetime
 
-# Load model bundle
+# ---------------- DB SETUP ----------------
+@st.cache_resource
+def get_connection():
+    conn = sqlite3.connect("cvd_predictions.db", check_same_thread=False)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS predictions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT,
+            age_years REAL,
+            gender INTEGER,
+            gender_label TEXT,
+            bmi REAL,
+            ap_hi REAL,
+            ap_lo REAL,
+            cholesterol REAL,
+            gluc REAL,
+            smoke INTEGER,
+            alco INTEGER,
+            active INTEGER,
+            pred INTEGER,
+            prob REAL
+        )
+        """
+    )
+    return conn
+
+conn = get_connection()
+
+def save_prediction_to_db(
+    age_years, gender, gender_label, bmi, ap_hi, ap_lo,
+    cholesterol, gluc, smoke, alco, active, pred, prob
+):
+    ts = datetime.utcnow().isoformat()
+    conn.execute(
+        """
+        INSERT INTO predictions (
+            timestamp, age_years, gender, gender_label, bmi, ap_hi, ap_lo,
+            cholesterol, gluc, smoke, alco, active, pred, prob
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            ts,
+            float(age_years),
+            int(gender),
+            gender_label,
+            float(bmi),
+            float(ap_hi),
+            float(ap_lo),
+            float(cholesterol),
+            float(gluc),
+            int(smoke),
+            int(alco),
+            int(active),
+            int(pred),
+            float(prob),
+        ),
+    )
+    conn.commit()
+
+# ---------------- MODEL LOAD ----------------
 bundle = joblib.load("cardio_test_stacked_model.pkl")
 model = bundle["model"]
 feature_names = bundle["feature_names"]
@@ -89,19 +151,35 @@ if st.button("Predict CVD Risk"):
     X_new = pd.DataFrame([row])[feature_names]
 
     # Predict
-    prob = model.predict_proba(X_new)[0, 1]
-    pred = model.predict(X_new)[0]
+    prob = float(model.predict_proba(X_new)[0, 1])
+    pred = int(model.predict(X_new)[0])
 
     label = "CVD (High Risk)" if pred == 1 else "No CVD (Low Risk)"
     st.subheader(f"Prediction: {label}")
     st.write(f"Estimated CVD probability: **{prob:.3f}**")
 
-    if pred == 1:
-        st.warning(
-            "The model suggests elevated CVD risk. "
-            "Kindly consider further evaluation and guideline-based management."
-        )
-    else:
-        st.info(
-            "The model suggests low CVD risk. Continue routine monitoring and healthy lifestyle."
-        )
+    # ---------- SAVE TO DB ----------
+    save_prediction_to_db(
+        age_years=age_years,
+        gender=gender,
+        gender_label=gender_label,
+        bmi=bmi,
+        ap_hi=ap_hi,
+        ap_lo=ap_lo,
+        cholesterol=cholesterol,
+        gluc=gluc,
+        smoke=smoke,
+        alco=alco,
+        active=active,
+        pred=pred,
+        prob=prob,
+    )
+
+    st.success("Record saved to database ✅")
+
+# Optional: view last few records
+with st.expander("Show recent saved predictions"):
+    df_log = pd.read_sql_query(
+        "SELECT * FROM predictions ORDER BY id DESC LIMIT 10", conn
+    )
+    st.dataframe(df_log)
