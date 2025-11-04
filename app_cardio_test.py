@@ -1,4 +1,4 @@
-# app_cvd_predictor.py
+# app_cvd_mmol.py
 
 import streamlit as st
 import joblib
@@ -21,13 +21,15 @@ def bmi_category(bmi: float) -> str:
     else:
         return "Obese (Class II/III)"
 
+
 def bp_category(sys: float, dia: float) -> str:
     """
-    BP categories:
-      - Normal:   systolic <120 and diastolic <80
-      - Elevated: 120–139 and diastolic <90
-      - Hypertension: systolic ≥140 or diastolic ≥90
-      - Otherwise: At-Risk (Borderline)
+    BP categories (flexible):
+
+      Normal:     systolic <120 and diastolic <80
+      Elevated:   120–139 and diastolic <90
+      Hypertension: systolic ≥140 or diastolic ≥90
+      Otherwise:  At-Risk (Borderline)
     """
     if sys < 120 and dia < 80:
         return "Normal"
@@ -37,8 +39,15 @@ def bp_category(sys: float, dia: float) -> str:
         return "Elevated"
     return "At-Risk (Borderline)"
 
+
 def cholesterol_category(chol: float) -> str:
-    """Total cholesterol in mmol/L."""
+    """
+    Total cholesterol in mmol/L:
+
+      Normal:    < 5.2
+      Borderline: 5.2–6.2
+      High:      ≥ 6.2
+    """
     if chol < 5.2:
         return "Normal"
     elif chol < 6.2:
@@ -46,8 +55,15 @@ def cholesterol_category(chol: float) -> str:
     else:
         return "Abnormal / High Risk"
 
+
 def glucose_category(glu: float) -> str:
-    """Fasting glucose in mmol/L."""
+    """
+    Fasting glucose in mmol/L:
+
+      Normal:     < 5.6
+      Prediabetes: 5.6–6.9
+      Diabetes:   ≥ 7.0
+    """
     if glu < 5.6:
         return "Normal"
     elif glu < 7.0:
@@ -55,12 +71,14 @@ def glucose_category(glu: float) -> str:
     else:
         return "Diabetes"
 
+
 def overall_risk_level(bmi_cat: str, bp_cat: str, chol_cat: str, glu_cat: str) -> str:
     """
     Flexible overall risk:
-      - High when multiple high-risk factors
-      - Moderate for single high-risk or several borderline
-      - Low when most values are normal
+      - High when multiple high-risk factors (Hypertension, Diabetes,
+        Abnormal cholesterol, Overweight/Obese) are present.
+      - Moderate for single high-risk or several borderline.
+      - Low when most values are normal.
     """
     high_flags = 0
     moderate_flags = 0
@@ -95,11 +113,13 @@ def overall_risk_level(bmi_cat: str, bp_cat: str, chol_cat: str, glu_cat: str) -
         return "Moderate Overall Risk"
     return "Low Overall Risk"
 
+
 # ---------------- DB SETUP ----------------
 
 @st.cache_resource
 def get_connection():
-    conn = sqlite3.connect("cvd_predictions.db", check_same_thread=False)
+    # New DB name to avoid old schema conflicts
+    conn = sqlite3.connect("cvd_predictions_v2.db", check_same_thread=False)
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS predictions (
@@ -121,7 +141,9 @@ def get_connection():
     )
     return conn
 
+
 conn = get_connection()
+
 
 def save_prediction_to_db(
     age_years,
@@ -163,12 +185,15 @@ def save_prediction_to_db(
     )
     conn.commit()
 
+
 # ---------------- MODEL LOAD ----------------
 
 bundle = joblib.load("cardio_mmol_stacked_model.pkl")
 model = bundle["model"]
 feature_names = bundle["feature_names"]
 feature_defaults = bundle["feature_defaults"]
+
+# ---------------- UI ----------------
 
 st.title("AI-Powered Cardiovascular Disease (CVD) Risk Predictor")
 
@@ -229,6 +254,8 @@ st.markdown(
     "> This tool is for decision support only and does **not** replace professional medical advice."
 )
 
+# ---------------- PREDICTION ----------------
+
 if st.button("Predict CVD Risk"):
     # Base row from training medians
     row = dict(feature_defaults)
@@ -244,7 +271,7 @@ if st.button("Predict CVD Risk"):
 
     X_new = pd.DataFrame([row])[feature_names]
 
-    # Model outputs
+    # Model probability
     prob_model = float(model.predict_proba(X_new)[0, 1])
 
     # Detailed categories
@@ -255,7 +282,7 @@ if st.button("Predict CVD Risk"):
     overall = overall_risk_level(bmi_cat, bp_cat, chol_cat, glu_cat)
 
     # ----- Reconcile prediction with overall risk -----
-    # Force consistency: Overall risk drives final prediction
+    # Overall drives final label to keep "Prediction" consistent
     if overall == "High Overall Risk":
         final_pred = 1
     elif overall == "Low Overall Risk":
@@ -295,7 +322,8 @@ if st.button("Predict CVD Risk"):
 
     st.success("Record saved to database ✅")
 
-# Optional: view recent records
+# ---------------- VIEW RECENT RECORDS ----------------
+
 with st.expander("Show recent saved predictions"):
     df_log = pd.read_sql_query(
         "SELECT * FROM predictions ORDER BY id DESC LIMIT 10", conn
