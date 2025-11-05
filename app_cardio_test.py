@@ -326,6 +326,7 @@ if st.button("Predict CVD Risk"):
 
 with st.expander("Show recent saved predictions"):
     df_log = pd.read_sql_query(
-        "SELECT * FROM predictions ORDER BY id DESC LIMIT 10", conn
+        "SELECT * FROM predictions ORDER BY id DESC LIMIT 25", conn
     )
     st.dataframe(df_log)
+
